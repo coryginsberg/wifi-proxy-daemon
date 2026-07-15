@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ginsbc.wifi-proxy-daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BINARY_PATH__</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>WIFI_PROXY_DOMAIN_MATCH</key>
+    <string>__DOMAIN_MATCH__</string>
+    <key>WIFI_PROXY_STATE_FILE</key>
+    <string>__STATE_PATH__</string>
+    <key>WIFI_PROXY_VPN_MATCH</key>
+    <string>__VPN_MATCH__</string>
+    <key>WIFI_PROXY_URL</key>
+    <string>__PROXY_URL__</string>
+    <key>WIFI_PROXY_HOST</key>
+    <string>__PROXY_HOST__</string>
+    <key>WIFI_PROXY_PORT</key>
+    <string>__PROXY_PORT__</string>
+    <key>WIFI_PROXY_NO_PROXY</key>
+    <string>__PROXY_NO_PROXY__</string>
+    <key>WIFI_PROXY_NON_PROXY_HOSTS</key>
+    <string>__PROXY_NON_PROXY_HOSTS__</string>
+    <key>WIFI_PROXY_NOTIFIER_APP</key>
+    <string>__NOTIFIER_APP__</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_PATH__</string>
+
+  <key>StandardErrorPath</key>
+  <string>__LOG_PATH__</string>
+</dict>
+</plist>
