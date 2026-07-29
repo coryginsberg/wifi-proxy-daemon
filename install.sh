@@ -17,8 +17,8 @@ VPN_MATCH="${WIFI_PROXY_VPN_MATCH:-Cisco Secure Client}"
 PROXY_URL="${WIFI_PROXY_URL:-http://proxy.cat.com:80}"
 PROXY_HOST="${WIFI_PROXY_HOST:-proxy.cat.com}"
 PROXY_PORT="${WIFI_PROXY_PORT:-80}"
-PROXY_NO_PROXY="${WIFI_PROXY_NO_PROXY:-localhost,.cat.com,169.254.169.254}"
-PROXY_NON_PROXY_HOSTS="${WIFI_PROXY_NON_PROXY_HOSTS:-*.cat.com|localhost}"
+PROXY_NO_PROXY="${WIFI_PROXY_NO_PROXY:-localhost,127.0.0.1,::1,.cat.com,169.254.169.254}"
+PROXY_NON_PROXY_HOSTS="${WIFI_PROXY_NON_PROXY_HOSTS:-*.cat.com|localhost|127.0.0.1|::1}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Run install.sh with sudo." >&2

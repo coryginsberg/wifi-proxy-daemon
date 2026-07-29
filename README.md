@@ -36,8 +36,8 @@ sudo WIFI_PROXY_DOMAIN_MATCH='example.com' \
      WIFI_PROXY_URL='http://proxy.example.com:80' \
      WIFI_PROXY_HOST='proxy.example.com' \
      WIFI_PROXY_PORT='80' \
-     WIFI_PROXY_NO_PROXY='localhost,.example.com' \
-     WIFI_PROXY_NON_PROXY_HOSTS='*.example.com|localhost' \
+     WIFI_PROXY_NO_PROXY='localhost,127.0.0.1,::1,.example.com' \
+     WIFI_PROXY_NON_PROXY_HOSTS='*.example.com|localhost|127.0.0.1|::1' \
      ./install.sh
 ```
 

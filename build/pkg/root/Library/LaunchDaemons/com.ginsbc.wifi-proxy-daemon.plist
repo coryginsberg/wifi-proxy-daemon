@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ginsbc.wifi-proxy-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/libexec/wifi-proxy-daemon/wifi-proxy-daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>WIFI_PROXY_DOMAIN_MATCH</key>
+		<string>cat.com</string>
+		<key>WIFI_PROXY_STATE_FILE</key>
+		<string>/var/run/wifi-proxy-daemon.state</string>
+		<key>WIFI_PROXY_VPN_MATCH</key>
+		<string>Cisco Secure Client</string>
+		<key>WIFI_PROXY_URL</key>
+		<string>http://proxy.cat.com:80</string>
+		<key>WIFI_PROXY_HOST</key>
+		<string>proxy.cat.com</string>
+		<key>WIFI_PROXY_PORT</key>
+		<string>80</string>
+		<key>WIFI_PROXY_NO_PROXY</key>
+		<string>localhost,.cat.com,169.254.169.254</string>
+		<key>WIFI_PROXY_NON_PROXY_HOSTS</key>
+		<string>*.cat.com|localhost</string>
+		<key>WIFI_PROXY_NOTIFIER_APP</key>
+		<string>/Applications/Utilities/WiFiProxyNotifier.app</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/var/log/wifi-proxy-daemon.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/wifi-proxy-daemon.log</string>
+</dict>
+</plist>

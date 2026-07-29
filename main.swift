@@ -62,8 +62,8 @@ final class WiFiProxyController {
         let proxyURL = environment["WIFI_PROXY_URL"] ?? "http://proxy.cat.com:80"
         let proxyHost = environment["WIFI_PROXY_HOST"] ?? "proxy.cat.com"
         let proxyPort = Int(environment["WIFI_PROXY_PORT"] ?? "80") ?? 80
-        let noProxy = environment["WIFI_PROXY_NO_PROXY"] ?? "localhost,.cat.com,169.254.169.254"
-        let nonProxyHosts = environment["WIFI_PROXY_NON_PROXY_HOSTS"] ?? "*.cat.com|localhost"
+        let noProxy = environment["WIFI_PROXY_NO_PROXY"] ?? "localhost,127.0.0.1,::1,.cat.com,169.254.169.254"
+        let nonProxyHosts = environment["WIFI_PROXY_NON_PROXY_HOSTS"] ?? "*.cat.com|localhost|127.0.0.1|::1"
         self.proxyConfiguration = ProxyConfiguration(
             url: proxyURL,
             host: proxyHost,
