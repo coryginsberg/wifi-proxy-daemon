@@ -4,10 +4,14 @@ set -euo pipefail
 SERVICE_NAME="com.ginsbc.wifi-proxy-daemon"
 PLIST_PATH="/Library/LaunchDaemons/$SERVICE_NAME.plist"
 NOTIFIER_APP_PATH="/Applications/Utilities/WiFiProxyNotifier.app"
+LEGACY_NOTIFIER_APP_PATH="/Applications/WiFiProxyNotifier.app"
 STATE_PATH="/var/run/wifi-proxy-daemon.state"
 BINARY_PATH="/usr/local/libexec/wifi-proxy-daemon/wifi-proxy-daemon"
 
 launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
+
+# Remove the notifier app from its legacy top-level location on upgrade.
+rm -rf "$LEGACY_NOTIFIER_APP_PATH"
 
 # Force a clean baseline on reinstall before the daemon starts watching state
 # again. This clears any previously managed proxy settings and then drops the

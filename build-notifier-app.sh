@@ -12,6 +12,8 @@ CONTENTS_DIR="$APP_PATH/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE_PATH="$MACOS_DIR/WiFiProxyNotifier"
+APP_VERSION="${WIFI_PROXY_VERSION:-$(<"$PROJECT_DIR/VERSION")}"
+APP_VERSION="${APP_VERSION//[[:space:]]/}"
 
 rm -rf "$APP_PATH"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
@@ -24,6 +26,11 @@ swiftc "$PROJECT_DIR/notification_helper.swift" \
 
 cp "$PROJECT_DIR/WiFiProxyNotifier-Info.plist" "$CONTENTS_DIR/Info.plist"
 chmod 755 "$EXECUTABLE_PATH"
+
+# Keep the bundle version in step with the package version. This has to happen
+# before codesign so the values are bound to the signature.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$CONTENTS_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$CONTENTS_DIR/Info.plist"
 
 # Generate the proxy app icon and place it in the bundle before signing so it is
 # bound to the signature. Rendering is done with a small Swift program so the

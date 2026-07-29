@@ -63,7 +63,19 @@ sudo ./uninstall.sh
 ./build-pkg.sh
 ```
 
-Writes `dist/WiFiProxyDaemon-1.0.0.pkg`. Override `PACKAGE_VERSION` or any `WIFI_PROXY_*` variable to bake in different defaults.
+Writes `dist/WiFiProxyDaemon-<version>.pkg`, where the version comes from the `VERSION` file. Override `PACKAGE_VERSION` or any `WIFI_PROXY_*` variable to bake in different defaults.
+
+## Versioning and releases
+
+The `VERSION` file is the single source of truth for the package version and the notifier bundle version. Increment it with:
+
+```sh
+./bump-version.sh patch   # or minor, major
+```
+
+`./build-pkg.sh --bump patch` bumps and builds in one step.
+
+Pushing a `VERSION` change to `main` triggers `.github/workflows/release.yml`, which builds the package on a macOS runner and publishes it as the latest GitHub release tagged `v<version>`. If a release for the current version already exists, the workflow skips the build, so unrelated pushes to `main` are no-ops.
 
 ## Troubleshooting
 

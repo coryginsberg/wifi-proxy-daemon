@@ -2,6 +2,12 @@
 set -euo pipefail
 
 PROJECT_DIR="${0:A:h}"
+
+# Optionally roll the semantic version before building: build-pkg.sh --bump [part]
+if [[ "${1:-}" == "--bump" ]]; then
+  "$PROJECT_DIR/bump-version.sh" "${2:-patch}" >/dev/null
+fi
+
 SERVICE_NAME="com.ginsbc.wifi-proxy-daemon"
 BUILD_DIR="${WIFI_PROXY_BUILD_DIR:-$PROJECT_DIR/build/pkg}"
 ROOT_DIR="$BUILD_DIR/root"
@@ -22,8 +28,10 @@ PROXY_HOST="${WIFI_PROXY_HOST:-proxy.cat.com}"
 PROXY_PORT="${WIFI_PROXY_PORT:-80}"
 PROXY_NO_PROXY="${WIFI_PROXY_NO_PROXY:-localhost,127.0.0.1,::1,.cat.com,169.254.169.254}"
 PROXY_NON_PROXY_HOSTS="${WIFI_PROXY_NON_PROXY_HOSTS:-*.cat.com|localhost|127.0.0.1|::1}"
-PACKAGE_VERSION="${PACKAGE_VERSION:-1.0.0}"
+PACKAGE_VERSION="${PACKAGE_VERSION:-$(<"$PROJECT_DIR/VERSION")}"
+PACKAGE_VERSION="${PACKAGE_VERSION//[[:space:]]/}"
 PACKAGE_PATH="$DIST_DIR/WiFiProxyDaemon-$PACKAGE_VERSION.pkg"
+export WIFI_PROXY_VERSION="$PACKAGE_VERSION"
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$INSTALL_DIR" "$SHARE_DIR" "$ROOT_DIR/Library/LaunchDaemons" "$DIST_DIR"
