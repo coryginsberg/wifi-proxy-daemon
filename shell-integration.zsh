@@ -4,7 +4,7 @@
 function restart-proxy {
     local service="com.ginsbc.wifi-proxy-daemon"
     local state_file="/var/run/wifi-proxy-daemon.state"
-    local notifier="/Applications/WiFiProxyNotifier.app"
+    local notifier="/Applications/Utilities/WiFiProxyNotifier.app"
 
     echo "Restarting ${service}..."
 

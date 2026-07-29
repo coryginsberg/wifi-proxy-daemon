@@ -48,6 +48,9 @@ final class WiFiProxyController {
     private var lastNetwork: String?
     private var wasProxyEnabled: Bool
     private var hasReconciledState = false
+    private let evaluationDebounceInterval: TimeInterval = 2.5
+    private var pendingEvaluation: DispatchWorkItem?
+    private var isEvaluating = false
 
     init() {
         let environment = ProcessInfo.processInfo.environment
@@ -55,7 +58,7 @@ final class WiFiProxyController {
         self.stateFileURL = URL(fileURLWithPath: environment["WIFI_PROXY_STATE_FILE"] ?? "/var/run/wifi-proxy-daemon.state")
         self.notificationTitle = environment["WIFI_PROXY_NOTIFICATION_TITLE"] ?? "Wi-Fi Proxy"
         self.vpnMatch = environment["WIFI_PROXY_VPN_MATCH"] ?? "Cisco Secure Client"
-        self.notifierAppPath = environment["WIFI_PROXY_NOTIFIER_APP"] ?? "/Applications/WiFiProxyNotifier.app"
+        self.notifierAppPath = environment["WIFI_PROXY_NOTIFIER_APP"] ?? "/Applications/Utilities/WiFiProxyNotifier.app"
         let proxyURL = environment["WIFI_PROXY_URL"] ?? "http://proxy.cat.com:80"
         let proxyHost = environment["WIFI_PROXY_HOST"] ?? "proxy.cat.com"
         let proxyPort = Int(environment["WIFI_PROXY_PORT"] ?? "80") ?? 80
@@ -82,7 +85,7 @@ final class WiFiProxyController {
             }
 
             let controller = Unmanaged<WiFiProxyController>.fromOpaque(info).takeUnretainedValue()
-            controller.evaluateProxyState()
+            controller.scheduleEvaluation()
         }
 
         var context = SCDynamicStoreContext(
@@ -126,27 +129,50 @@ final class WiFiProxyController {
         evaluateProxyState()
     }
 
+    // Collapse bursts of network-change notifications into a single settled
+    // evaluation. Rapid IPv4/IPv6/AirPort churn during a network transition can
+    // momentarily hide the corporate DNS domain; evaluating mid-transition made
+    // the proxy state (and its notification) flap.
+    private func scheduleEvaluation() {
+        pendingEvaluation?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.evaluateProxyState()
+        }
+        pendingEvaluation = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + evaluationDebounceInterval, execute: work)
+    }
+
     private func evaluateProxyState() {
+        // Guard against re-entrancy: applyProxyConfiguration runs nested run
+        // loops while waiting on subprocesses, which can service a pending
+        // scheduled evaluation.
+        if isEvaluating {
+            return
+        }
+        isEvaluating = true
+        defer { isEvaluating = false }
+
         let matchedNetwork = currentMatchingNetwork()
         let vpnConnection = currentVPNConnection()
         let shouldEnableProxy = matchedNetwork != nil || vpnConnection != nil
         let isInitialEvaluation = !hasReconciledState
+        let stateChanged = shouldEnableProxy != wasProxyEnabled
 
-        if isInitialEvaluation {
+        // Reconcile the actual system configuration on first run and whenever the
+        // effective proxy state changes.
+        if isInitialEvaluation || stateChanged {
             applyProxyConfiguration(enabled: shouldEnableProxy)
-
-            if shouldEnableProxy {
-                sendNotification(subtitle: "Proxy enabled", message: notificationMessage(network: matchedNetwork, vpnConnection: vpnConnection))
-            }
-        } else if shouldEnableProxy, !wasProxyEnabled {
-            applyProxyConfiguration(enabled: true)
-            sendNotification(subtitle: "Proxy enabled", message: notificationMessage(network: matchedNetwork, vpnConnection: vpnConnection))
-        } else if !shouldEnableProxy, wasProxyEnabled {
-            applyProxyConfiguration(enabled: false)
-            sendNotification(subtitle: "Proxy disabled", message: notificationMessage(network: matchedNetwork, vpnConnection: vpnConnection))
         }
 
-        if isInitialEvaluation || matchedNetwork != lastNetwork || shouldEnableProxy != wasProxyEnabled {
+        // Only notify on a genuine change of proxy state. A restart or reconcile
+        // that finds the proxy already in its persisted state stays silent.
+        if stateChanged {
+            let subtitle = shouldEnableProxy ? "Proxy enabled" : "Proxy disabled"
+            sendNotification(subtitle: subtitle, message: notificationMessage(network: matchedNetwork, vpnConnection: vpnConnection))
+        }
+
+        if isInitialEvaluation || matchedNetwork != lastNetwork || stateChanged {
             lastNetwork = matchedNetwork
             wasProxyEnabled = shouldEnableProxy
             hasReconciledState = true

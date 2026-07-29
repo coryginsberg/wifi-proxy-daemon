@@ -7,7 +7,8 @@ INSTALL_DIR="/usr/local/libexec/wifi-proxy-daemon"
 BINARY_PATH="$INSTALL_DIR/wifi-proxy-daemon"
 SHARE_DIR="/usr/local/share/wifi-proxy-daemon"
 SHELL_INTEGRATION_PATH="$SHARE_DIR/shell-integration.zsh"
-NOTIFIER_APP_PATH="/Applications/WiFiProxyNotifier.app"
+NOTIFIER_APP_PATH="/Applications/Utilities/WiFiProxyNotifier.app"
+LEGACY_NOTIFIER_APP_PATH="/Applications/WiFiProxyNotifier.app"
 PLIST_PATH="/Library/LaunchDaemons/$SERVICE_NAME.plist"
 LOG_PATH="/var/log/wifi-proxy-daemon.log"
 STATE_PATH="/var/run/wifi-proxy-daemon.state"
@@ -29,6 +30,7 @@ swiftc "$PROJECT_DIR/main.swift" -o "$BINARY_PATH"
 chmod 755 "$BINARY_PATH"
 chown root:wheel "$BINARY_PATH"
 
+rm -rf "$LEGACY_NOTIFIER_APP_PATH"
 "$PROJECT_DIR/build-notifier-app.sh" "$NOTIFIER_APP_PATH"
 chown -R root:wheel "$NOTIFIER_APP_PATH"
 
@@ -60,6 +62,13 @@ chmod 644 "$PLIST_PATH"
 chown root:wheel "$PLIST_PATH"
 
 launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
+
+# Force a clean baseline on reinstall before the daemon starts watching state
+# again. This clears any previously managed proxy settings and then drops the
+# persisted state so startup always reconciles from scratch.
+WIFI_PROXY_TEST_NETWORK="" WIFI_PROXY_TEST_VPN="" "$BINARY_PATH" --once >/dev/null 2>&1 || true
+rm -f "$STATE_PATH"
+
 launchctl bootstrap system "$PLIST_PATH"
 launchctl enable "system/$SERVICE_NAME"
 launchctl kickstart -k "system/$SERVICE_NAME"

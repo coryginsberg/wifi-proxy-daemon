@@ -3,7 +3,8 @@ set -euo pipefail
 
 SERVICE_NAME="com.ginsbc.wifi-proxy-daemon"
 INSTALL_DIR="/usr/local/libexec/wifi-proxy-daemon"
-NOTIFIER_APP_PATH="/Applications/WiFiProxyNotifier.app"
+NOTIFIER_APP_PATH="/Applications/Utilities/WiFiProxyNotifier.app"
+LEGACY_NOTIFIER_APP_PATH="/Applications/WiFiProxyNotifier.app"
 PLIST_PATH="/Library/LaunchDaemons/$SERVICE_NAME.plist"
 
 if [[ $EUID -ne 0 ]]; then
@@ -15,6 +16,7 @@ launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
 rm -f "$PLIST_PATH"
 rm -rf "$INSTALL_DIR"
 rm -rf "$NOTIFIER_APP_PATH"
+rm -rf "$LEGACY_NOTIFIER_APP_PATH"
 rm -rf /usr/local/share/wifi-proxy-daemon
 rm -f /var/run/wifi-proxy-daemon.state
 

@@ -3,9 +3,20 @@ set -euo pipefail
 
 SERVICE_NAME="com.ginsbc.wifi-proxy-daemon"
 PLIST_PATH="/Library/LaunchDaemons/$SERVICE_NAME.plist"
-NOTIFIER_APP_PATH="/Applications/WiFiProxyNotifier.app"
+NOTIFIER_APP_PATH="/Applications/Utilities/WiFiProxyNotifier.app"
+STATE_PATH="/var/run/wifi-proxy-daemon.state"
+BINARY_PATH="/usr/local/libexec/wifi-proxy-daemon/wifi-proxy-daemon"
 
 launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
+
+# Force a clean baseline on reinstall before the daemon starts watching state
+# again. This clears any previously managed proxy settings and then drops the
+# persisted state so startup always reconciles from scratch.
+if [[ -x "$BINARY_PATH" ]]; then
+  WIFI_PROXY_TEST_NETWORK="" WIFI_PROXY_TEST_VPN="" "$BINARY_PATH" --once >/dev/null 2>&1 || true
+fi
+rm -f "$STATE_PATH"
+
 launchctl bootstrap system "$PLIST_PATH"
 launchctl enable "system/$SERVICE_NAME"
 launchctl kickstart -k "system/$SERVICE_NAME"
