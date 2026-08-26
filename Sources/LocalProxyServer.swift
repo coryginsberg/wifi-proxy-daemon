@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// An HTTP proxy bound to loopback that clients point at permanently.
 ///
@@ -12,18 +13,19 @@ import Foundation
 /// connection through the macOS system proxy setting and offers no working
 /// opt-out. Since this daemon points that setting at its own listener, an
 /// NWConnection "direct" dial loops back in and never reaches an origin.
-final class LocalProxyServer: @unchecked Sendable {
+final class LocalProxyServer: Sendable {
     /// How far above the preferred port to look for a free one.
     private static let portScanRange = 16
 
+    private struct State {
+        var mode: ProxyMode = .direct
+        var hasResolvedMode = false
+        var sessions: [UInt64: ProxySession] = [:]
+        var nextSessionID: UInt64 = 0
+    }
+
     private let preferredPort: UInt16
-    private let stateLock = NSLock()
-    private var mode: ProxyMode = .direct
-    private var hasResolvedMode = false
-    private var sessions: [UInt64: ProxySession] = [:]
-    private var nextSessionID: UInt64 = 0
-    private var listenFD: Int32 = -1
-    private(set) var boundPort: UInt16 = 0
+    private let state = Mutex(State())
 
     init(preferredPort: UInt16) {
         self.preferredPort = preferredPort
@@ -42,15 +44,14 @@ final class LocalProxyServer: @unchecked Sendable {
 
         for candidate in Self.candidatePorts(startingAt: preferredPort) {
             do {
-                listenFD = try bindListener(port: candidate)
-                boundPort = candidate
+                let listenFD = try bindListener(port: candidate)
 
                 if candidate != preferredPort {
                     fputs("Local proxy port \(preferredPort) unavailable; using \(candidate)\n", stderr)
                 }
 
-                let thread = Thread { [weak self] in
-                    self?.acceptLoop()
+                let thread = Thread { [self] in
+                    acceptLoop(listenFD: listenFD)
                 }
                 thread.name = "local-proxy-accept"
                 thread.start()
@@ -118,30 +119,33 @@ final class LocalProxyServer: @unchecked Sendable {
     }
 
     func setMode(_ newMode: ProxyMode) {
-        stateLock.lock()
-
-        // The first resolution is forced through even when it matches the
-        // initial `.direct`, so the log always records the route once.
-        guard !hasResolvedMode || newMode != mode else {
-            stateLock.unlock()
-            return
-        }
-
-        let isFirstResolution = !hasResolvedMode
-        hasResolvedMode = true
-        mode = newMode
-
         // Sockets established over the previous route are already dead, but
         // client connection pools do not know that and will hand them out again.
         // Dropping them turns a confusing "socket connection was closed
         // unexpectedly" into a clean reconnect.
-        var doomed: [ProxySession] = []
-        if !isFirstResolution {
-            doomed = Array(sessions.values)
-            sessions.removeAll()
+        let doomed: [ProxySession]? = state.withLock { state in
+            // The first resolution is forced through even when it matches the
+            // initial `.direct`, so the log always records the route once.
+            guard !state.hasResolvedMode || newMode != state.mode else {
+                return nil
+            }
+
+            let isFirstResolution = !state.hasResolvedMode
+            state.hasResolvedMode = true
+            state.mode = newMode
+
+            guard !isFirstResolution else {
+                return []
+            }
+
+            let active = Array(state.sessions.values)
+            state.sessions.removeAll()
+            return active
         }
 
-        stateLock.unlock()
+        guard let doomed else {
+            return
+        }
 
         // Answers resolved over the previous route may not be valid on the new
         // one, so they go out with the connections that used them.
@@ -154,7 +158,7 @@ final class LocalProxyServer: @unchecked Sendable {
         }
     }
 
-    private func acceptLoop() {
+    private func acceptLoop(listenFD: Int32) {
         while true {
             var address = sockaddr()
             var length = socklen_t(MemoryLayout<sockaddr>.size)
@@ -186,23 +190,22 @@ final class LocalProxyServer: @unchecked Sendable {
     }
 
     private func startSession(clientFD: Int32) {
-        stateLock.lock()
-        let id = nextSessionID
-        nextSessionID &+= 1
-        let currentMode = mode
-        let session = ProxySession(id: id, clientFD: clientFD, mode: currentMode) { [weak self] finishedID in
-            self?.removeSession(finishedID)
+        let session = state.withLock { state -> ProxySession in
+            let id = state.nextSessionID
+            state.nextSessionID &+= 1
+
+            let session = ProxySession(id: id, clientFD: clientFD, mode: state.mode) { [weak self] finishedID in
+                self?.removeSession(finishedID)
+            }
+            state.sessions[id] = session
+            return session
         }
-        sessions[id] = session
-        stateLock.unlock()
 
         session.start()
     }
 
     private func removeSession(_ id: UInt64) {
-        stateLock.lock()
-        sessions.removeValue(forKey: id)
-        stateLock.unlock()
+        _ = state.withLock { $0.sessions.removeValue(forKey: id) }
     }
 
     /// Shared by the listener, accepted clients and outbound dials.

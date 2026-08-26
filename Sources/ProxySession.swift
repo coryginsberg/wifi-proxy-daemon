@@ -1,22 +1,27 @@
 import Foundation
+import Synchronization
 
-final class ProxySession: @unchecked Sendable {
+final class ProxySession: Sendable {
     private static let maximumHeadBytes = 64 * 1024
     private static let relayBufferBytes = 64 * 1024
     private static let connectTimeout: TimeInterval = 15
     private static let headTerminator = Data("\r\n\r\n".utf8)
 
+    /// Teardown state. Reaching a descriptor requires holding the lock, so a
+    /// `shutdown()` cannot race the `close()` that frees the same number.
+    private struct State {
+        var remoteFD: Int32 = -1
+        var isClosed = false
+        var isRelaying = false
+    }
+
     private let id: UInt64
     private let clientFD: Int32
     private let mode: ProxyMode
-    private let onFinish: (UInt64) -> Void
+    private let onFinish: @Sendable (UInt64) -> Void
+    private let state = Mutex(State())
 
-    private let lock = NSLock()
-    private var remoteFD: Int32 = -1
-    private var isClosed = false
-    private var isRelaying = false
-
-    init(id: UInt64, clientFD: Int32, mode: ProxyMode, onFinish: @escaping (UInt64) -> Void) {
+    init(id: UInt64, clientFD: Int32, mode: ProxyMode, onFinish: @escaping @Sendable (UInt64) -> Void) {
         self.id = id
         self.clientFD = clientFD
         self.mode = mode
@@ -34,20 +39,19 @@ final class ProxySession: @unchecked Sendable {
 
     /// Unblocks both relay directions so the session tears itself down.
     ///
-    /// Runs under the lock and bails once closed. A descriptor number is reused
-    /// by the kernel the moment it is freed, so shutting one down outside the
-    /// lock could hit an unrelated connection that has since inherited it.
+    /// A descriptor number is reused by the kernel the moment it is freed, so
+    /// this bails once closed rather than shutting down a number an unrelated
+    /// connection has since inherited.
     func shutdownNow() {
-        lock.lock()
-        defer { lock.unlock() }
+        state.withLock { state in
+            guard !state.isClosed else {
+                return
+            }
 
-        guard !isClosed else {
-            return
-        }
-
-        shutdown(clientFD, SHUT_RDWR)
-        if remoteFD >= 0 {
-            shutdown(remoteFD, SHUT_RDWR)
+            shutdown(clientFD, SHUT_RDWR)
+            if state.remoteFD >= 0 {
+                shutdown(state.remoteFD, SHUT_RDWR)
+            }
         }
     }
 
@@ -158,12 +162,13 @@ final class ProxySession: @unchecked Sendable {
             return nil
         }
 
-        lock.lock()
-        let alreadyClosed = isClosed
-        if !alreadyClosed {
-            remoteFD = fd
+        let alreadyClosed = state.withLock { state -> Bool in
+            guard !state.isClosed else {
+                return true
+            }
+            state.remoteFD = fd
+            return false
         }
-        lock.unlock()
 
         if alreadyClosed {
             close(fd)
@@ -174,15 +179,14 @@ final class ProxySession: @unchecked Sendable {
     }
 
     private func relayBothWays(remote: Int32) {
-        lock.lock()
-        isRelaying = true
-        lock.unlock()
+        state.withLock { $0.isRelaying = true }
 
         let group = DispatchGroup()
         group.enter()
 
-        let outbound = Thread { [weak self] in
-            self?.relay(from: self?.clientFD ?? -1, to: remote)
+        let client = clientFD
+        let outbound = Thread { [self] in
+            relay(from: client, to: remote)
             group.leave()
         }
         outbound.name = "local-proxy-relay"
@@ -226,13 +230,9 @@ final class ProxySession: @unchecked Sendable {
     }
 
     private func respond(_ status: String) {
-        lock.lock()
-        let relaying = isRelaying
-        lock.unlock()
-
         // Once the tunnel is live an HTTP status would be injected into the
         // caller's byte stream, so say nothing and just drop the connection.
-        guard !relaying else {
+        guard !state.withLock({ $0.isRelaying }) else {
             return
         }
 
@@ -241,21 +241,25 @@ final class ProxySession: @unchecked Sendable {
     }
 
     private func closeAll() {
-        lock.lock()
-        guard !isClosed else {
-            lock.unlock()
-            return
-        }
-        isClosed = true
-
         // Closed under the lock so a concurrent shutdownNow() cannot act on a
         // descriptor number the kernel has already handed to someone else.
-        close(clientFD)
-        if remoteFD >= 0 {
-            close(remoteFD)
-            remoteFD = -1
+        let alreadyClosed = state.withLock { state -> Bool in
+            guard !state.isClosed else {
+                return true
+            }
+            state.isClosed = true
+
+            close(clientFD)
+            if state.remoteFD >= 0 {
+                close(state.remoteFD)
+                state.remoteFD = -1
+            }
+            return false
         }
-        lock.unlock()
+
+        guard !alreadyClosed else {
+            return
+        }
 
         onFinish(id)
     }

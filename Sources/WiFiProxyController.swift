@@ -2,7 +2,10 @@ import CoreWLAN
 import Foundation
 import SystemConfiguration
 
-final class WiFiProxyController: @unchecked Sendable {
+/// Confined to the main thread: it owns the run loop the SCDynamicStore
+/// notifications arrive on, so its state needs no lock of its own.
+@MainActor
+final class WiFiProxyController {
     /// Ceiling on any helper process this daemon shells out to.
     private static let commandTimeout: TimeInterval = 15
 
