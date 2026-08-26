@@ -20,34 +20,26 @@ if [[ -x "$BINARY_PATH" ]]; then
 fi
 rm -f "$STATE_PATH"
 
-LISTEN_PORT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:WIFI_PROXY_LISTEN_PORT' "$PLIST_PATH" 2>/dev/null || echo 3128)"
-
-# Everything on this machine is about to be pointed at this port. If something
-# else already owns it the daemon can never bind, so stop before publishing.
-if /usr/bin/nc -z 127.0.0.1 "$LISTEN_PORT" >/dev/null 2>&1; then
-  echo "Port $LISTEN_PORT is already in use; not starting wifi-proxy-daemon." >&2
-  lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >&2 || true
-  # The payload is already on disk. Without this the plist would still be
-  # loaded on the next boot and would publish settings it cannot serve.
-  rm -f "$PLIST_PATH"
-  exit 1
-fi
-
 launchctl bootstrap system "$PLIST_PATH"
 launchctl enable "system/$SERVICE_NAME"
 launchctl kickstart -k "system/$SERVICE_NAME"
 
-LISTENER_UP=0
+# The daemon falls back to the next free port if its preferred one is taken, so
+# read back the port it actually bound rather than assuming.
+BOUND_PORT=""
 for _ in $(seq 1 40); do
-  if /usr/bin/nc -z 127.0.0.1 "$LISTEN_PORT" >/dev/null 2>&1; then
-    LISTENER_UP=1
+  BOUND_PORT="$(/usr/bin/python3 -c "import json
+try: print(json.load(open('$STATE_PATH')).get('listenPort') or '')
+except Exception: pass" 2>/dev/null || true)"
+  if [[ -n "$BOUND_PORT" ]] && /usr/bin/nc -z 127.0.0.1 "$BOUND_PORT" >/dev/null 2>&1; then
     break
   fi
+  BOUND_PORT=""
   sleep 0.25
 done
 
-if [[ $LISTENER_UP -ne 1 ]]; then
-  echo "wifi-proxy-daemon never bound 127.0.0.1:$LISTEN_PORT; rolling back." >&2
+if [[ -z "$BOUND_PORT" ]]; then
+  echo "wifi-proxy-daemon never reported a listening port; rolling back." >&2
   launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
   "$BINARY_PATH" --reset >/dev/null 2>&1 || true
   rm -f "$PLIST_PATH"

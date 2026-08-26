@@ -25,18 +25,12 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Every proxy setting on this machine will be pointed at this port. If something
-# else already owns it the daemon can never bind, and the result is a machine
-# with no working network path, so refuse before touching anything.
 if /usr/bin/nc -z 127.0.0.1 "$LISTEN_PORT" >/dev/null 2>&1; then
-  echo "Port $LISTEN_PORT is already in use by:" >&2
-  lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >&2 || true
-  echo "Free it, or set WIFI_PROXY_LISTEN_PORT to a different port." >&2
-  exit 1
+  echo "Port $LISTEN_PORT is in use; the daemon will pick the next free port." >&2
 fi
 
 mkdir -p "$INSTALL_DIR"
-swiftc "$PROJECT_DIR/main.swift" "$PROJECT_DIR/LocalProxyServer.swift" -O -o "$BINARY_PATH"
+swiftc -swift-version 6 "$PROJECT_DIR"/Sources/*.swift -O -o "$BINARY_PATH"
 chmod 755 "$BINARY_PATH"
 chown root:wheel "$BINARY_PATH"
 
@@ -89,18 +83,22 @@ launchctl kickstart -k "system/$SERVICE_NAME"
 
 # Every proxy setting on this machine now points at the daemon's loopback
 # listener, so a daemon that came up without binding would break all networking.
-# Verify it is accepting and roll the whole install back if it is not.
-LISTENER_UP=0
+# The daemon records the port it actually bound, which is not necessarily
+# $LISTEN_PORT, so read it back rather than assuming.
+BOUND_PORT=""
 for _ in $(seq 1 40); do
-  if /usr/bin/nc -z 127.0.0.1 "$LISTEN_PORT" >/dev/null 2>&1; then
-    LISTENER_UP=1
+  BOUND_PORT="$(/usr/bin/python3 -c "import json,sys
+try: print(json.load(open('$STATE_PATH')).get('listenPort') or '')
+except Exception: pass" 2>/dev/null || true)"
+  if [[ -n "$BOUND_PORT" ]] && /usr/bin/nc -z 127.0.0.1 "$BOUND_PORT" >/dev/null 2>&1; then
     break
   fi
+  BOUND_PORT=""
   sleep 0.25
 done
 
-if [[ $LISTENER_UP -ne 1 ]]; then
-  echo "wifi-proxy-daemon is not listening on 127.0.0.1:$LISTEN_PORT; rolling back." >&2
+if [[ -z "$BOUND_PORT" ]]; then
+  echo "wifi-proxy-daemon never reported a listening port; rolling back." >&2
   launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
   "$BINARY_PATH" --reset >/dev/null 2>&1 || true
   # Leaving the plist behind would re-bootstrap the failing daemon on next boot.
@@ -138,7 +136,7 @@ printf 'Shell integration: %s\n' "$SHELL_INTEGRATION_PATH"
 printf 'Domain match: %s\n' "$DOMAIN_MATCH"
 printf 'VPN match: %s\n' "$VPN_MATCH"
 printf 'Upstream proxy: %s:%s\n' "$PROXY_HOST" "$PROXY_PORT"
-printf 'Local listener: http://127.0.0.1:%s\n' "$LISTEN_PORT"
+printf 'Local listener: http://127.0.0.1:%s\n' "$BOUND_PORT"
 printf '\n'
 printf 'All proxy settings now point at the local listener. If networking ever\n'
 printf 'stops working, restore direct access with:\n'

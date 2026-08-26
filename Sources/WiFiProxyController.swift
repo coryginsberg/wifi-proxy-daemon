@@ -2,56 +2,16 @@ import CoreWLAN
 import Foundation
 import SystemConfiguration
 
-private let commandTimeout: TimeInterval = 15
+final class WiFiProxyController: @unchecked Sendable {
+    /// Ceiling on any helper process this daemon shells out to.
+    private static let commandTimeout: TimeInterval = 15
 
-private struct PersistedState: Codable {
-    var lastNetwork: String?
-    var wasProxyEnabled: Bool
-}
-
-private let localProxyHost = "127.0.0.1"
-
-private struct ProxyConfiguration {
-    /// The corporate proxy. Only the local forwarder ever talks to it.
-    let host: String
-    let port: Int
-    /// The loopback forwarder every client is pointed at, permanently.
-    let listenPort: UInt16
-    let noProxy: String
-    let nonProxyHosts: String
-
-    var listenURL: String {
-        "http://\(localProxyHost):\(listenPort)"
-    }
-
-    var bypassDomains: [String] {
-        noProxy
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-    }
-
-    var javaProxyOptions: String {
-        "-Dhttp.proxyHost=\(localProxyHost) -Dhttp.proxyPort=\(listenPort) -Dhttps.proxyHost=\(localProxyHost) -Dhttps.proxyPort=\(listenPort)"
-    }
-
-    var sbtProxyOptions: String {
-        "\(javaProxyOptions) -Dhttp.nonProxyHosts=\(nonProxyHosts) -Dhttps.nonProxyHosts=\(nonProxyHosts)"
-    }
-}
-
-private struct ConsoleUser {
-    let name: String
-    let uid: uid_t
-}
-
-final class WiFiProxyController {
     private let domainMatch: String
     private let stateFileURL: URL
     private let notificationTitle: String
     private let vpnMatch: String
     private let notifierAppPath: String
-    private let proxyConfiguration: ProxyConfiguration
+    private var proxyConfiguration: ProxyConfiguration
     private let localProxy: LocalProxyServer
     private var lastNetwork: String?
     private var wasProxyEnabled: Bool
@@ -69,20 +29,23 @@ final class WiFiProxyController {
         self.notifierAppPath = environment["WIFI_PROXY_NOTIFIER_APP"] ?? "/Applications/Utilities/WiFiProxyNotifier.app"
         let proxyHost = environment["WIFI_PROXY_HOST"] ?? "proxy.cat.com"
         let proxyPort = Int(environment["WIFI_PROXY_PORT"] ?? "80") ?? 80
-        let listenPort = UInt16(environment["WIFI_PROXY_LISTEN_PORT"] ?? "3128") ?? 3128
+        let configuredListenPort = UInt16(environment["WIFI_PROXY_LISTEN_PORT"] ?? "3128") ?? 3128
         let noProxy = environment["WIFI_PROXY_NO_PROXY"] ?? "localhost,127.0.0.1,::1,.cat.com,169.254.169.254"
         let nonProxyHosts = environment["WIFI_PROXY_NON_PROXY_HOSTS"] ?? "*.cat.com|localhost|127.0.0.1|::1"
         self.proxyConfiguration = ProxyConfiguration(
             host: proxyHost,
             port: proxyPort,
-            listenPort: listenPort,
+            listenPort: configuredListenPort,
             noProxy: noProxy,
             nonProxyHosts: nonProxyHosts
         )
-        self.localProxy = LocalProxyServer(listenPort: listenPort)
         let state = Self.loadState(from: stateFileURL)
         self.lastNetwork = state.lastNetwork
         self.wasProxyEnabled = state.wasProxyEnabled
+
+        // Reuse last run's port when there was one, so the address clients read
+        // at launch does not move under them across a daemon restart.
+        self.localProxy = LocalProxyServer(preferredPort: state.listenPort ?? configuredListenPort)
     }
 
     /// `publishConfiguration: false` runs the forwarder and network detection
@@ -93,11 +56,16 @@ final class WiFiProxyController {
             // Managed configuration is published only after the listener is
             // confirmed accepting. Pointing clients at a loopback port that
             // never bound would blackhole every request on the machine.
-            try localProxy.start { [weak self] in
+            try localProxy.start { [weak self] boundPort in
                 DispatchQueue.main.async {
                     guard let self else {
                         return
                     }
+
+                    // Publish whatever port was actually bound, and remember it
+                    // so the next start prefers the same one.
+                    self.proxyConfiguration.listenPort = boundPort
+
                     if publishConfiguration {
                         self.applyManagedConfiguration(enabled: true)
                     }
@@ -172,7 +140,7 @@ final class WiFiProxyController {
         let shouldEnableProxy = matchedNetwork != nil || vpnConnection != nil
         let route = shouldEnableProxy ? "upstream \(proxyConfiguration.host):\(proxyConfiguration.port)" : "direct"
 
-        print("listener: \(proxyConfiguration.listenURL)")
+        print("listener: \(proxyConfiguration.listenURL) (preferred; falls back if taken)")
         print("route:    \(route)")
         print("network:  \(matchedNetwork ?? "-")")
         print("vpn:      \(vpnConnection ?? "-")")
@@ -238,7 +206,11 @@ final class WiFiProxyController {
             lastNetwork = matchedNetwork
             wasProxyEnabled = shouldEnableProxy
             hasReconciledState = true
-            persistState(PersistedState(lastNetwork: matchedNetwork, wasProxyEnabled: shouldEnableProxy))
+            persistState(PersistedState(
+                lastNetwork: matchedNetwork,
+                wasProxyEnabled: shouldEnableProxy,
+                listenPort: proxyConfiguration.listenPort
+            ))
         }
     }
 
@@ -347,7 +319,7 @@ final class WiFiProxyController {
 
     private static func loadState(from stateFileURL: URL) -> PersistedState {
         guard let data = try? Data(contentsOf: stateFileURL) else {
-            return PersistedState(lastNetwork: nil, wasProxyEnabled: false)
+            return PersistedState(lastNetwork: nil, wasProxyEnabled: false, listenPort: nil)
         }
 
         if let state = try? JSONDecoder().decode(PersistedState.self, from: data) {
@@ -355,7 +327,7 @@ final class WiFiProxyController {
         }
 
         let value = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        return PersistedState(lastNetwork: value.isEmpty ? nil : value, wasProxyEnabled: false)
+        return PersistedState(lastNetwork: value.isEmpty ? nil : value, wasProxyEnabled: false, listenPort: nil)
     }
 
     private func persistState(_ state: PersistedState) {
@@ -399,7 +371,7 @@ final class WiFiProxyController {
             return nil
         }
 
-        let deadline = Date().addingTimeInterval(commandTimeout)
+        let deadline = Date().addingTimeInterval(Self.commandTimeout)
         while process.isRunning && Date() < deadline {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
@@ -451,12 +423,12 @@ final class WiFiProxyController {
             if enabled {
                 runProcess(
                     executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setwebproxy", service, localProxyHost, listenPort],
+                    arguments: ["-setwebproxy", service, ProxyConfiguration.localHost, listenPort],
                     errorPrefix: "Failed to set web proxy for \(service)"
                 )
                 runProcess(
                     executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setsecurewebproxy", service, localProxyHost, listenPort],
+                    arguments: ["-setsecurewebproxy", service, ProxyConfiguration.localHost, listenPort],
                     errorPrefix: "Failed to set secure web proxy for \(service)"
                 )
                 runProcess(
@@ -610,7 +582,7 @@ final class WiFiProxyController {
             return nil
         }
 
-        let deadline = Date().addingTimeInterval(commandTimeout)
+        let deadline = Date().addingTimeInterval(Self.commandTimeout)
         while process.isRunning && Date() < deadline {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
@@ -667,7 +639,7 @@ final class WiFiProxyController {
             return
         }
 
-        let deadline = Date().addingTimeInterval(commandTimeout)
+        let deadline = Date().addingTimeInterval(Self.commandTimeout)
         while process.isRunning && Date() < deadline {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
@@ -710,17 +682,4 @@ final class WiFiProxyController {
 
         return String(line[afterFirstQuote..<secondQuote])
     }
-}
-
-let controller = WiFiProxyController()
-
-if CommandLine.arguments.contains("--reset") {
-    controller.reset()
-} else if CommandLine.arguments.contains("--once") {
-    controller.reportState()
-} else if CommandLine.arguments.contains("--listen-only") {
-    // Development: exercise the forwarder without root or config side effects.
-    controller.run(publishConfiguration: false)
-} else {
-    controller.run()
 }

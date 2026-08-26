@@ -52,7 +52,7 @@ sudo WIFI_PROXY_DOMAIN_MATCH='example.com' \
      ./install.sh
 ```
 
-`WIFI_PROXY_HOST` and `WIFI_PROXY_PORT` are the upstream corporate proxy, which only the local listener ever talks to. `WIFI_PROXY_LISTEN_PORT` is the loopback port clients are pointed at; change it if something else already uses 3128.
+`WIFI_PROXY_HOST` and `WIFI_PROXY_PORT` are the upstream corporate proxy, which only the local listener ever talks to. `WIFI_PROXY_LISTEN_PORT` is the preferred loopback port. If it is already taken the daemon binds the next free port above it and publishes that instead, then keeps reusing it across restarts so the address clients captured at launch never moves.
 
 ## Run
 
@@ -147,7 +147,7 @@ The proxy settings are also reachable without a terminal in System Settings > Ne
 
 - Daemon log: `/var/log/wifi-proxy-daemon.log`, which records each route switch
 - State file: `/var/run/wifi-proxy-daemon.state`
-- Confirm the listener is up with `nc -z 127.0.0.1 3128` (or your `WIFI_PROXY_LISTEN_PORT`). If it is not, nothing will reach the network; check the log.
+- The port actually in use is recorded in the state file: `python3 -c "import json;print(json.load(open('/var/run/wifi-proxy-daemon.state'))['listenPort'])"`. Confirm it is accepting with `nc -z 127.0.0.1 <port>`. If it is not, nothing will reach the network; check the log.
 - Detection uses the DNS domain rather than the Wi-Fi SSID, because recent macOS releases gate SSID access behind Location Services, which a root LaunchDaemon cannot obtain.
 - The listener uses POSIX sockets rather than Network.framework, which routes every connection through the macOS system proxy setting with no working opt-out. Since that setting points at the listener itself, a Network.framework dial would loop straight back in.
 - Notification permission is requested at install time and again the first time a notification is posted.

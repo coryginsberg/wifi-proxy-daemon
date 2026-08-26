@@ -36,7 +36,7 @@ export WIFI_PROXY_VERSION="$PACKAGE_VERSION"
 rm -rf "$BUILD_DIR"
 mkdir -p "$INSTALL_DIR" "$SHARE_DIR" "$ROOT_DIR/Library/LaunchDaemons" "$DIST_DIR"
 
-swiftc "$PROJECT_DIR/main.swift" "$PROJECT_DIR/LocalProxyServer.swift" -O -o "$STAGED_BINARY_PATH"
+swiftc -swift-version 6 "$PROJECT_DIR"/Sources/*.swift -O -o "$STAGED_BINARY_PATH"
 chmod 755 "$STAGED_BINARY_PATH"
 
 "$PROJECT_DIR/build-notifier-app.sh" "$APP_PATH"
