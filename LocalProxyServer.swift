@@ -28,6 +28,8 @@ enum LocalProxyError: Error, CustomStringConvertible {
 private let maximumHeadBytes = 64 * 1024
 private let relayBufferBytes = 64 * 1024
 private let connectTimeout: TimeInterval = 15
+private let resolverCacheTTL: TimeInterval = 60
+private let resolverCacheLimit = 256
 private let headTerminator = Data("\r\n\r\n".utf8)
 
 /// An HTTP proxy bound to loopback that clients point at permanently.
@@ -131,6 +133,10 @@ final class LocalProxyServer {
         }
 
         stateLock.unlock()
+
+        // Answers resolved over the previous route may not be valid on the new
+        // one, so they go out with the connections that used them.
+        ResolverCache.shared.removeAll()
 
         fputs("Local proxy route: \(newMode.description)\n", stderr)
 
@@ -287,6 +293,89 @@ private struct ProxyRequest {
             return nil
         }
         return (String(authority[..<colon]), port)
+    }
+}
+
+private struct ResolvedAddress {
+    let family: Int32
+    let socktype: Int32
+    let protocolNumber: Int32
+    let storage: [UInt8]
+    let length: socklen_t
+
+    init?(_ info: addrinfo) {
+        guard let address = info.ai_addr, info.ai_addrlen > 0 else {
+            return nil
+        }
+
+        family = info.ai_family
+        socktype = info.ai_socktype
+        protocolNumber = info.ai_protocol
+        length = info.ai_addrlen
+        storage = Array(UnsafeRawBufferPointer(start: UnsafeRawPointer(address), count: Int(info.ai_addrlen)))
+    }
+}
+
+/// Caches resolved addresses so a connection does not pay a resolver round trip.
+///
+/// macOS serializes `getaddrinfo` through mDNSResponder, so a burst of
+/// connections queues up behind each other even when every answer is already in
+/// the system cache. In upstream mode the cost is pure waste: every connection
+/// re-resolves the same corporate proxy hostname.
+private final class ResolverCache {
+    static let shared = ResolverCache()
+
+    private struct Entry {
+        let addresses: [ResolvedAddress]
+        let expiry: Date
+    }
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+
+    func addresses(for key: String) -> [ResolvedAddress]? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let entry = entries[key] else {
+            return nil
+        }
+
+        guard entry.expiry > Date() else {
+            entries.removeValue(forKey: key)
+            return nil
+        }
+
+        return entry.addresses
+    }
+
+    func store(_ addresses: [ResolvedAddress], for key: String) {
+        guard !addresses.isEmpty else {
+            return
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Bounded so a long-lived daemon cannot accumulate every host ever
+        // visited. Wholesale eviction is fine at this size.
+        if entries.count >= resolverCacheLimit {
+            entries.removeAll(keepingCapacity: true)
+        }
+
+        entries[key] = Entry(addresses: addresses, expiry: Date().addingTimeInterval(resolverCacheTTL))
+    }
+
+    func invalidate(_ key: String) {
+        lock.lock()
+        entries.removeValue(forKey: key)
+        lock.unlock()
+    }
+
+    func removeAll() {
+        lock.lock()
+        entries.removeAll(keepingCapacity: true)
+        lock.unlock()
     }
 }
 
@@ -590,29 +679,60 @@ private final class ProxySession {
     }
 
     private static func connectSocket(host: String, port: UInt16) -> Int32? {
+        let key = "\(host):\(port)"
+
+        // A cached answer can go stale before its TTL expires, so a failure to
+        // connect falls through to a fresh lookup rather than giving up.
+        if let cached = ResolverCache.shared.addresses(for: key) {
+            if let fd = connectToFirstReachable(cached) {
+                return fd
+            }
+            ResolverCache.shared.invalidate(key)
+        }
+
+        let resolved = resolve(host: host, port: port)
+        guard !resolved.isEmpty else {
+            return nil
+        }
+
+        ResolverCache.shared.store(resolved, for: key)
+        return connectToFirstReachable(resolved)
+    }
+
+    private static func resolve(host: String, port: UInt16) -> [ResolvedAddress] {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_STREAM
 
         var result: UnsafeMutablePointer<addrinfo>?
         guard getaddrinfo(host, String(port), &hints, &result) == 0, let list = result else {
-            return nil
+            return []
         }
         defer { freeaddrinfo(list) }
 
+        var addresses: [ResolvedAddress] = []
         var candidate: UnsafeMutablePointer<addrinfo>? = list
         while let info = candidate {
-            if let fd = tryConnect(info.pointee) {
-                return fd
+            if let address = ResolvedAddress(info.pointee) {
+                addresses.append(address)
             }
             candidate = info.pointee.ai_next
         }
 
+        return addresses
+    }
+
+    private static func connectToFirstReachable(_ addresses: [ResolvedAddress]) -> Int32? {
+        for address in addresses {
+            if let fd = tryConnect(address) {
+                return fd
+            }
+        }
         return nil
     }
 
-    private static func tryConnect(_ info: addrinfo) -> Int32? {
-        let fd = socket(info.ai_family, info.ai_socktype, info.ai_protocol)
+    private static func tryConnect(_ address: ResolvedAddress) -> Int32? {
+        let fd = socket(address.family, address.socktype, address.protocolNumber)
         guard fd >= 0 else {
             return nil
         }
@@ -622,7 +742,11 @@ private final class ProxySession {
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
-        var status = connect(fd, info.ai_addr, info.ai_addrlen)
+        var status = address.storage.withUnsafeBufferPointer { buffer -> Int32 in
+            buffer.baseAddress!.withMemoryRebound(to: sockaddr.self, capacity: 1) { pointer in
+                Darwin.connect(fd, pointer, address.length)
+            }
+        }
 
         if status != 0 && errno == EINPROGRESS {
             var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
