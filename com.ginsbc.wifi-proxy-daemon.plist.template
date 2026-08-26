@@ -24,12 +24,12 @@
     <string>__STATE_PATH__</string>
     <key>WIFI_PROXY_VPN_MATCH</key>
     <string>__VPN_MATCH__</string>
-    <key>WIFI_PROXY_URL</key>
-    <string>__PROXY_URL__</string>
     <key>WIFI_PROXY_HOST</key>
     <string>__PROXY_HOST__</string>
     <key>WIFI_PROXY_PORT</key>
     <string>__PROXY_PORT__</string>
+    <key>WIFI_PROXY_LISTEN_PORT</key>
+    <string>__LISTEN_PORT__</string>
     <key>WIFI_PROXY_NO_PROXY</key>
     <string>__PROXY_NO_PROXY__</string>
     <key>WIFI_PROXY_NON_PROXY_HOSTS</key>

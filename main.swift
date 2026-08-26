@@ -9,12 +9,20 @@ private struct PersistedState: Codable {
     var wasProxyEnabled: Bool
 }
 
+private let localProxyHost = "127.0.0.1"
+
 private struct ProxyConfiguration {
-    let url: String
+    /// The corporate proxy. Only the local forwarder ever talks to it.
     let host: String
     let port: Int
+    /// The loopback forwarder every client is pointed at, permanently.
+    let listenPort: UInt16
     let noProxy: String
     let nonProxyHosts: String
+
+    var listenURL: String {
+        "http://\(localProxyHost):\(listenPort)"
+    }
 
     var bypassDomains: [String] {
         noProxy
@@ -24,18 +32,17 @@ private struct ProxyConfiguration {
     }
 
     var javaProxyOptions: String {
-        "-Dhttp.proxyHost=\(host) -Dhttp.proxyPort=\(port) -Dhttps.proxyHost=\(host) -Dhttps.proxyPort=\(port)"
+        "-Dhttp.proxyHost=\(localProxyHost) -Dhttp.proxyPort=\(listenPort) -Dhttps.proxyHost=\(localProxyHost) -Dhttps.proxyPort=\(listenPort)"
     }
 
     var sbtProxyOptions: String {
-        "-Dhttp.proxyHost=\(host) -Dhttp.proxyPort=\(port) -Dhttps.proxyHost=\(host) -Dhttps.proxyPort=\(port) -Dhttp.nonProxyHosts=\(nonProxyHosts) -Dhttps.nonProxyHosts=\(nonProxyHosts)"
+        "\(javaProxyOptions) -Dhttp.nonProxyHosts=\(nonProxyHosts) -Dhttps.nonProxyHosts=\(nonProxyHosts)"
     }
 }
 
 private struct ConsoleUser {
     let name: String
     let uid: uid_t
-    let homeDirectory: URL
 }
 
 final class WiFiProxyController {
@@ -45,6 +52,7 @@ final class WiFiProxyController {
     private let vpnMatch: String
     private let notifierAppPath: String
     private let proxyConfiguration: ProxyConfiguration
+    private let localProxy: LocalProxyServer
     private var lastNetwork: String?
     private var wasProxyEnabled: Bool
     private var hasReconciledState = false
@@ -59,25 +67,57 @@ final class WiFiProxyController {
         self.notificationTitle = environment["WIFI_PROXY_NOTIFICATION_TITLE"] ?? "Wi-Fi Proxy"
         self.vpnMatch = environment["WIFI_PROXY_VPN_MATCH"] ?? "Cisco Secure Client"
         self.notifierAppPath = environment["WIFI_PROXY_NOTIFIER_APP"] ?? "/Applications/Utilities/WiFiProxyNotifier.app"
-        let proxyURL = environment["WIFI_PROXY_URL"] ?? "http://proxy.cat.com:80"
         let proxyHost = environment["WIFI_PROXY_HOST"] ?? "proxy.cat.com"
         let proxyPort = Int(environment["WIFI_PROXY_PORT"] ?? "80") ?? 80
+        let listenPort = UInt16(environment["WIFI_PROXY_LISTEN_PORT"] ?? "3128") ?? 3128
         let noProxy = environment["WIFI_PROXY_NO_PROXY"] ?? "localhost,127.0.0.1,::1,.cat.com,169.254.169.254"
         let nonProxyHosts = environment["WIFI_PROXY_NON_PROXY_HOSTS"] ?? "*.cat.com|localhost|127.0.0.1|::1"
         self.proxyConfiguration = ProxyConfiguration(
-            url: proxyURL,
             host: proxyHost,
             port: proxyPort,
+            listenPort: listenPort,
             noProxy: noProxy,
             nonProxyHosts: nonProxyHosts
         )
+        self.localProxy = LocalProxyServer(listenPort: listenPort)
         let state = Self.loadState(from: stateFileURL)
         self.lastNetwork = state.lastNetwork
         self.wasProxyEnabled = state.wasProxyEnabled
     }
 
-    func run() {
-        evaluateProxyState()
+    /// `publishConfiguration: false` runs the forwarder and network detection
+    /// without touching system proxy settings, launchd env, the shell file, or
+    /// git config. Lets the proxy be exercised without root or side effects.
+    func run(publishConfiguration: Bool = true) {
+        do {
+            // Managed configuration is published only after the listener is
+            // confirmed accepting. Pointing clients at a loopback port that
+            // never bound would blackhole every request on the machine.
+            try localProxy.start { [weak self] in
+                DispatchQueue.main.async {
+                    guard let self else {
+                        return
+                    }
+                    if publishConfiguration {
+                        self.applyManagedConfiguration(enabled: true)
+                    }
+                    self.evaluateProxyState()
+                }
+            }
+        } catch {
+            fputs("Failed to start local proxy: \(error)\n", stderr)
+
+            // Every proxy setting on this machine may already point at the
+            // listener from an earlier successful run, and those settings
+            // survive reboots. Leaving them in place while the listener is dead
+            // takes the whole machine offline, with no network to look up a fix.
+            // Fail open instead: revert to direct and let launchd retry.
+            if publishConfiguration {
+                applyManagedConfiguration(enabled: false)
+            }
+
+            exit(1)
+        }
 
         let callback: SCDynamicStoreCallBack = { _, _, info in
             guard let info else {
@@ -125,8 +165,25 @@ final class WiFiProxyController {
         CFRunLoopRun()
     }
 
-    func runOnce() {
-        evaluateProxyState()
+    /// Prints the detected network state without touching any configuration.
+    func reportState() {
+        let matchedNetwork = currentMatchingNetwork()
+        let vpnConnection = currentVPNConnection()
+        let shouldEnableProxy = matchedNetwork != nil || vpnConnection != nil
+        let route = shouldEnableProxy ? "upstream \(proxyConfiguration.host):\(proxyConfiguration.port)" : "direct"
+
+        print("listener: \(proxyConfiguration.listenURL)")
+        print("route:    \(route)")
+        print("network:  \(matchedNetwork ?? "-")")
+        print("vpn:      \(vpnConnection ?? "-")")
+    }
+
+    /// Strips every managed setting. Used by install for a clean baseline and by
+    /// uninstall, which must not leave the machine pointing at a loopback port
+    /// that no longer has anything listening on it.
+    func reset() {
+        applyManagedConfiguration(enabled: false)
+        try? FileManager.default.removeItem(at: stateFileURL)
     }
 
     // Collapse bursts of network-change notifications into a single settled
@@ -144,10 +201,11 @@ final class WiFiProxyController {
     }
 
     private func evaluateProxyState() {
-        // Guard against re-entrancy: applyProxyConfiguration runs nested run
-        // loops while waiting on subprocesses, which can service a pending
-        // scheduled evaluation.
+        // Re-entrant because applyManagedConfiguration and sendNotification run
+        // nested run loops that service the main queue. Reschedule rather than
+        // return, or the network change that triggered this is lost outright.
         if isEvaluating {
+            scheduleEvaluation()
             return
         }
         isEvaluating = true
@@ -159,19 +217,23 @@ final class WiFiProxyController {
         let isInitialEvaluation = !hasReconciledState
         let stateChanged = shouldEnableProxy != wasProxyEnabled
 
-        // Reconcile the actual system configuration on first run and whenever the
-        // effective proxy state changes.
-        if isInitialEvaluation || stateChanged {
-            applyProxyConfiguration(enabled: shouldEnableProxy)
-        }
+        // The only thing a network change touches. Client-visible configuration
+        // is static, so nothing has to be restarted to pick this up.
+        localProxy.setMode(
+            shouldEnableProxy
+                ? .upstream(host: proxyConfiguration.host, port: UInt16(proxyConfiguration.port))
+                : .direct
+        )
 
-        // Only notify on a genuine change of proxy state. A restart or reconcile
-        // that finds the proxy already in its persisted state stays silent.
+        // A restart that finds the proxy already in its persisted state stays silent.
         if stateChanged {
             let subtitle = shouldEnableProxy ? "Proxy enabled" : "Proxy disabled"
             sendNotification(subtitle: subtitle, message: notificationMessage(network: matchedNetwork, vpnConnection: vpnConnection))
         }
 
+        // The `isInitialEvaluation` term forces one write on every startup even
+        // when nothing changed. `restart-proxy` detects completion by watching
+        // this file's mtime and would hang without it.
         if isInitialEvaluation || matchedNetwork != lastNetwork || stateChanged {
             lastNetwork = matchedNetwork
             wasProxyEnabled = shouldEnableProxy
@@ -368,7 +430,10 @@ final class WiFiProxyController {
         return nil
     }
 
-    private func applyProxyConfiguration(enabled: Bool) {
+    /// Publishes (or strips) the loopback forwarder address across every surface
+    /// clients read at startup. Called once when the listener comes up, and
+    /// again with `false` on reset. Never on a network change.
+    private func applyManagedConfiguration(enabled: Bool) {
         updateSystemProxy(enabled: enabled)
 
         guard let consoleUser = Self.consoleUser() else {
@@ -376,21 +441,22 @@ final class WiFiProxyController {
         }
 
         updateLaunchdEnvironment(for: consoleUser, enabled: enabled)
-        updateShellProxyFile(for: consoleUser, enabled: enabled)
         updateGitProxy(for: consoleUser, enabled: enabled)
     }
 
     private func updateSystemProxy(enabled: Bool) {
+        let listenPort = String(proxyConfiguration.listenPort)
+
         for service in networkServices() {
             if enabled {
                 runProcess(
                     executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setwebproxy", service, proxyConfiguration.host, String(proxyConfiguration.port)],
+                    arguments: ["-setwebproxy", service, localProxyHost, listenPort],
                     errorPrefix: "Failed to set web proxy for \(service)"
                 )
                 runProcess(
                     executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setsecurewebproxy", service, proxyConfiguration.host, String(proxyConfiguration.port)],
+                    arguments: ["-setsecurewebproxy", service, localProxyHost, listenPort],
                     errorPrefix: "Failed to set secure web proxy for \(service)"
                 )
                 runProcess(
@@ -470,12 +536,12 @@ final class WiFiProxyController {
     private func launchdEnvironmentEntries(enabled: Bool) -> [(String, String?)] {
         if enabled {
             return [
-                ("ALL_PROXY", proxyConfiguration.url),
-                ("all_proxy", proxyConfiguration.url),
-                ("HTTP_PROXY", proxyConfiguration.url),
-                ("http_proxy", proxyConfiguration.url),
-                ("HTTPS_PROXY", proxyConfiguration.url),
-                ("https_proxy", proxyConfiguration.url),
+                ("ALL_PROXY", proxyConfiguration.listenURL),
+                ("all_proxy", proxyConfiguration.listenURL),
+                ("HTTP_PROXY", proxyConfiguration.listenURL),
+                ("http_proxy", proxyConfiguration.listenURL),
+                ("HTTPS_PROXY", proxyConfiguration.listenURL),
+                ("https_proxy", proxyConfiguration.listenURL),
                 ("NO_PROXY", proxyConfiguration.noProxy),
                 ("no_proxy", proxyConfiguration.noProxy),
                 ("JAVA_OPTS", proxyConfiguration.javaProxyOptions),
@@ -503,62 +569,16 @@ final class WiFiProxyController {
         ]
     }
 
-    private func updateShellProxyFile(for consoleUser: ConsoleUser, enabled: Bool) {
-        let shellFileURL = consoleUser.homeDirectory
-            .appendingPathComponent(".config", isDirectory: true)
-            .appendingPathComponent("wifi-proxy-daemon", isDirectory: true)
-            .appendingPathComponent("proxy-env.zsh")
-
-        do {
-            try FileManager.default.createDirectory(
-                at: shellFileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try shellProxyFileContents(enabled: enabled).write(to: shellFileURL, atomically: true, encoding: .utf8)
-        } catch {
-            fputs("Failed to update shell proxy file: \(error)\n", stderr)
-        }
-    }
-
-    private func shellProxyFileContents(enabled: Bool) -> String {
-        var lines = ["# Managed by wifi-proxy-daemon. Do not edit."]
-
-        if enabled {
-            lines.append("export ALL_PROXY=\(shellQuoted(proxyConfiguration.url))")
-            lines.append("export all_proxy=\(shellQuoted(proxyConfiguration.url))")
-            lines.append("export HTTP_PROXY=\(shellQuoted(proxyConfiguration.url))")
-            lines.append("export http_proxy=\(shellQuoted(proxyConfiguration.url))")
-            lines.append("export HTTPS_PROXY=\(shellQuoted(proxyConfiguration.url))")
-            lines.append("export https_proxy=\(shellQuoted(proxyConfiguration.url))")
-            lines.append("export NO_PROXY=\(shellQuoted(proxyConfiguration.noProxy))")
-            lines.append("export no_proxy=\(shellQuoted(proxyConfiguration.noProxy))")
-            lines.append("export JAVA_OPTS=\(shellQuoted(proxyConfiguration.javaProxyOptions))")
-            lines.append("export java_opts=\(shellQuoted(proxyConfiguration.javaProxyOptions))")
-            lines.append("export ES_JAVA_OPTS=\(shellQuoted(proxyConfiguration.javaProxyOptions))")
-            lines.append("export SBT_OPTS=\"${WIFI_PROXY_BASE_SBT_OPTS:-}\"")
-            lines.append("export SBT_OPTS=\"${SBT_OPTS:+$SBT_OPTS }\(proxyConfiguration.sbtProxyOptions)\"")
-            lines.append("export sbt_opts=\"$SBT_OPTS\"")
-        } else {
-            lines.append("unset ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy NO_PROXY no_proxy")
-            lines.append("unset JAVA_OPTS java_opts ES_JAVA_OPTS")
-            lines.append("export SBT_OPTS=\"${WIFI_PROXY_BASE_SBT_OPTS:-}\"")
-            lines.append("export sbt_opts=\"$SBT_OPTS\"")
-        }
-
-        lines.append("")
-        return lines.joined(separator: "\n")
-    }
-
     private func updateGitProxy(for consoleUser: ConsoleUser, enabled: Bool) {
         if enabled {
             runProcess(
                 executablePath: "/usr/bin/sudo",
-                arguments: ["-H", "-u", consoleUser.name, "/usr/bin/git", "config", "--global", "http.proxy", proxyConfiguration.url],
+                arguments: ["-H", "-u", consoleUser.name, "/usr/bin/git", "config", "--global", "http.proxy", proxyConfiguration.listenURL],
                 errorPrefix: "Failed to set git http proxy"
             )
             runProcess(
                 executablePath: "/usr/bin/sudo",
-                arguments: ["-H", "-u", consoleUser.name, "/usr/bin/git", "config", "--global", "https.proxy", proxyConfiguration.url],
+                arguments: ["-H", "-u", consoleUser.name, "/usr/bin/git", "config", "--global", "https.proxy", proxyConfiguration.listenURL],
                 errorPrefix: "Failed to set git https proxy"
             )
         } else {
@@ -573,11 +593,6 @@ final class WiFiProxyController {
                 errorPrefix: "Failed to unset git https proxy"
             )
         }
-    }
-
-    private func shellQuoted(_ value: String) -> String {
-        let escaped = value.replacingOccurrences(of: "'", with: "'\\''")
-        return "'\(escaped)'"
     }
 
     private func processOutput(executablePath: String, arguments: [String], errorPrefix: String) -> String? {
@@ -674,11 +689,13 @@ final class WiFiProxyController {
             return nil
         }
 
-        guard let homeDirectoryPath = NSHomeDirectoryForUser(user) else {
+        // Confirms the account resolves to a real directory-services record
+        // before we start running commands as it.
+        guard NSHomeDirectoryForUser(user) != nil else {
             return nil
         }
 
-        return ConsoleUser(name: user, uid: uid, homeDirectory: URL(fileURLWithPath: homeDirectoryPath, isDirectory: true))
+        return ConsoleUser(name: user, uid: uid)
     }
 
     private static func extractQuotedName(from line: String) -> String? {
@@ -697,8 +714,13 @@ final class WiFiProxyController {
 
 let controller = WiFiProxyController()
 
-if CommandLine.arguments.contains("--once") {
-    controller.runOnce()
+if CommandLine.arguments.contains("--reset") {
+    controller.reset()
+} else if CommandLine.arguments.contains("--once") {
+    controller.reportState()
+} else if CommandLine.arguments.contains("--listen-only") {
+    // Development: exercise the forwarder without root or config side effects.
+    controller.run(publishConfiguration: false)
 } else {
     controller.run()
 }

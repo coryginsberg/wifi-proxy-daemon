@@ -13,36 +13,64 @@ launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
 # Remove the notifier app from its legacy top-level location on upgrade.
 rm -rf "$LEGACY_NOTIFIER_APP_PATH"
 
-# Force a clean baseline on reinstall before the daemon starts watching state
-# again. This clears any previously managed proxy settings and then drops the
-# persisted state so startup always reconciles from scratch.
+# Clear any previously managed proxy settings so startup reconciles from a
+# known-clean baseline.
 if [[ -x "$BINARY_PATH" ]]; then
-  WIFI_PROXY_TEST_NETWORK="" WIFI_PROXY_TEST_VPN="" "$BINARY_PATH" --once >/dev/null 2>&1 || true
+  "$BINARY_PATH" --reset >/dev/null 2>&1 || true
 fi
 rm -f "$STATE_PATH"
+
+LISTEN_PORT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:WIFI_PROXY_LISTEN_PORT' "$PLIST_PATH" 2>/dev/null || echo 3128)"
+
+# Everything on this machine is about to be pointed at this port. If something
+# else already owns it the daemon can never bind, so stop before publishing.
+if /usr/bin/nc -z 127.0.0.1 "$LISTEN_PORT" >/dev/null 2>&1; then
+  echo "Port $LISTEN_PORT is already in use; not starting wifi-proxy-daemon." >&2
+  lsof -nP -iTCP:"$LISTEN_PORT" -sTCP:LISTEN >&2 || true
+  # The payload is already on disk. Without this the plist would still be
+  # loaded on the next boot and would publish settings it cannot serve.
+  rm -f "$PLIST_PATH"
+  exit 1
+fi
 
 launchctl bootstrap system "$PLIST_PATH"
 launchctl enable "system/$SERVICE_NAME"
 launchctl kickstart -k "system/$SERVICE_NAME"
 
-console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
-if [[ -n "$console_user" && "$console_user" != "root" && "$console_user" != "loginwindow" && -d "$NOTIFIER_APP_PATH" ]]; then
-  console_uid="$(id -u "$console_user")"
-  launchctl asuser "$console_uid" /usr/bin/open -n -a "$NOTIFIER_APP_PATH" --args --request-permission >/dev/null 2>&1 || true
+LISTENER_UP=0
+for _ in $(seq 1 40); do
+  if /usr/bin/nc -z 127.0.0.1 "$LISTEN_PORT" >/dev/null 2>&1; then
+    LISTENER_UP=1
+    break
+  fi
+  sleep 0.25
+done
+
+if [[ $LISTENER_UP -ne 1 ]]; then
+  echo "wifi-proxy-daemon never bound 127.0.0.1:$LISTEN_PORT; rolling back." >&2
+  launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || true
+  "$BINARY_PATH" --reset >/dev/null 2>&1 || true
+  rm -f "$PLIST_PATH"
+  exit 1
 fi
 
-# Register the restart-proxy shell integration in the console user's .zshrc.
+console_user="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+if [[ -n "$console_user" && "$console_user" != "root" && "$console_user" != "loginwindow" && -d "$NOTIFIER_APP_PATH" ]]; then
+  console_uid="$(id -u "$console_user" 2>/dev/null || true)"
+  [[ -n "$console_uid" ]] && launchctl asuser "$console_uid" /usr/bin/open -n -a "$NOTIFIER_APP_PATH" --args --request-permission >/dev/null 2>&1 || true
+fi
+
+# Run as the console user rather than root: appending as root would follow a
+# symlink at ~/.zshrc, and it avoids having to chown the result back.
 if [[ -n "$console_user" && "$console_user" != "root" && "$console_user" != "loginwindow" ]]; then
-  user_home="$(dscl . -read "/Users/$console_user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
-  [[ -z "$user_home" ]] && user_home="/Users/$console_user"
-  zshrc="$user_home/.zshrc"
-  marker="# >>> wifi-proxy-daemon shell integration >>>"
-  if [[ ! -f "$zshrc" ]] || ! grep -qF "$marker" "$zshrc"; then
-    {
-      printf '\n%s\n' "$marker"
-      printf '%s\n' '[ -f /usr/local/share/wifi-proxy-daemon/shell-integration.zsh ] && source /usr/local/share/wifi-proxy-daemon/shell-integration.zsh'
-      printf '%s\n' "# <<< wifi-proxy-daemon shell integration <<<"
-    } >> "$zshrc"
-    chown "$console_user" "$zshrc" 2>/dev/null || true
-  fi
+  sudo -H -u "$console_user" /bin/zsh -c '
+    zshrc="$HOME/.zshrc"
+    marker="# >>> wifi-proxy-daemon shell integration >>>"
+    if [[ ! -f "$zshrc" ]] || ! grep -qF "$marker" "$zshrc"; then
+      {
+        printf "\n%s\n" "$marker"
+        printf "%s\n" "[ -f /usr/local/share/wifi-proxy-daemon/shell-integration.zsh ] && source /usr/local/share/wifi-proxy-daemon/shell-integration.zsh"
+        printf "%s\n" "# <<< wifi-proxy-daemon shell integration <<<"
+      } >> "$zshrc"
+    fi' || true
 fi

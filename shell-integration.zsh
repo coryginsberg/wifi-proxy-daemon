@@ -1,6 +1,5 @@
-# Managed by wifi-proxy-daemon. Provides the `restart-proxy` command.
+# Managed by wifi-proxy-daemon. Do not edit.
 
-# Restart the wifi-proxy-daemon and notify the current proxy state when done.
 function restart-proxy {
     local service="com.ginsbc.wifi-proxy-daemon"
     local state_file="/var/run/wifi-proxy-daemon.state"
@@ -16,7 +15,8 @@ function restart-proxy {
         return 1
     fi
 
-    # Wait for the daemon to re-evaluate and rewrite its state file.
+    # The daemon always persists once on startup, even when nothing changed,
+    # so the mtime is a reliable completion signal. See evaluateProxyState.
     local attempt=0 cur_mtime
     while (( attempt < 40 )); do
         cur_mtime="$(stat -f %m "$state_file" 2>/dev/null || echo 0)"

@@ -6,18 +6,29 @@
 
 A macOS `launchd` daemon that turns your corporate proxy on and off automatically as you move between networks.
 
-It watches for network changes and enables the proxy when the active network's DNS domain matches a configured value (default `cat.com`) or a matching VPN is connected (default `Cisco Secure Client`). Otherwise it turns the proxy off. Each change posts a macOS notification.
+It watches for network changes and enables the proxy when the active network's DNS domain matches a configured value (default `cat.com`) or a matching VPN is connected (default `Cisco Secure Client`). Otherwise it turns the proxy off. Each change of proxy state posts a macOS notification.
 
-When the proxy state changes, the daemon updates:
+## How it routes
+
+The daemon runs its own HTTP forward proxy on `127.0.0.1:3128` for as long as it is alive, and points every proxy setting on the machine at that fixed address, once, at startup:
 
 - macOS system web and secure web proxy settings for all network services
 - user `launchctl` environment variables, for newly launched GUI apps
-- `~/.config/wifi-proxy-daemon/proxy-env.zsh`, for new shells
 - global git `http.proxy` and `https.proxy`
+
+A network change never touches any of those. It only switches where the local listener forwards to: straight to the origin when off the corporate network, or chained through the upstream proxy when on it.
+
+That indirection is the entire point. Proxy environment variables are read once at process start, so rewriting them never reaches an already-running process. Editors, language servers, and coding agents used to keep dialing an unreachable proxy after a network switch and had to be restarted. They now target an address that never changes.
+
+On the direct path the forwarder parses only the first request on a connection and relays the rest as opaque bytes, so a client reusing that connection for a different host would be answered by the wrong server. Plain HTTP is therefore rewritten with `Connection: close` and reuse is refused. `CONNECT` tunnels are unaffected.
+
+On each switch the daemon also drops its live connections. Sockets opened over the previous route are already dead, but client connection pools do not know that and will hand them out again, which surfaces as errors like `The socket connection was closed unexpectedly`. Forcing a reconnect avoids that.
+
+Because every proxy setting points at the listener, the daemon is a hard dependency for outbound traffic. `install.sh` verifies the listener is accepting before it finishes and rolls back if it is not, `launchd` restarts the daemon if it dies, and `uninstall.sh` reverts every setting before removing anything.
 
 ## Requirements
 
-- macOS with Xcode Command Line Tools (`swiftc`)
+- macOS with Xcode Command Line Tools (`swiftc` and `python3`)
 - Administrator access (the daemon runs as root)
 
 ## Build and install
@@ -33,13 +44,15 @@ Override any of the defaults at install time:
 ```sh
 sudo WIFI_PROXY_DOMAIN_MATCH='example.com' \
      WIFI_PROXY_VPN_MATCH='Your VPN Name' \
-     WIFI_PROXY_URL='http://proxy.example.com:80' \
      WIFI_PROXY_HOST='proxy.example.com' \
      WIFI_PROXY_PORT='80' \
+     WIFI_PROXY_LISTEN_PORT='3128' \
      WIFI_PROXY_NO_PROXY='localhost,127.0.0.1,::1,.example.com' \
      WIFI_PROXY_NON_PROXY_HOSTS='*.example.com|localhost|127.0.0.1|::1' \
      ./install.sh
 ```
+
+`WIFI_PROXY_HOST` and `WIFI_PROXY_PORT` are the upstream corporate proxy, which only the local listener ever talks to. `WIFI_PROXY_LISTEN_PORT` is the loopback port clients are pointed at; change it if something else already uses 3128.
 
 ## Run
 
@@ -49,7 +62,21 @@ The daemon starts automatically at install and on boot. To restart it manually a
 restart-proxy
 ```
 
-New shells pick up proxy variables automatically. Existing shells need a new tab or `exec zsh`.
+Proxy variables reach apps through `launchctl setenv`, so only processes launched after the daemon started see them. A shell in a terminal that was already running will not, and neither a new tab nor `exec zsh` helps, since both inherit the terminal app's environment. Quit and relaunch the terminal. None of this applies on a network change: the values never change, so nothing needs restarting.
+
+To print the detected state without changing anything:
+
+```sh
+sudo /usr/local/libexec/wifi-proxy-daemon/wifi-proxy-daemon --once
+```
+
+Network and VPN detection is accurate, but the `listener` and `route` lines fall back to the built-in defaults, because the configured values come from the LaunchDaemon plist rather than the binary.
+
+To strip every proxy setting and go back to direct networking:
+
+```sh
+sudo /usr/local/libexec/wifi-proxy-daemon/wifi-proxy-daemon --reset
+```
 
 ## Uninstall
 
@@ -63,7 +90,7 @@ sudo ./uninstall.sh
 ./build-pkg.sh
 ```
 
-Writes `dist/WiFiProxyDaemon-<version>.pkg`, where the version comes from the `VERSION` file. Override `PACKAGE_VERSION` or any `WIFI_PROXY_*` variable to bake in different defaults.
+Writes `dist/WiFiProxyDaemon-<version>.pkg`, where the version comes from the `VERSION` file. Override `PACKAGE_VERSION`, or any of the `WIFI_PROXY_*` variables listed under Build and install, to bake in different defaults.
 
 ## Versioning and releases
 
@@ -77,9 +104,50 @@ The `VERSION` file is the single source of truth for the package version and the
 
 Pushing a `VERSION` change to `main` triggers `.github/workflows/release.yml`, which builds the package on a macOS runner and publishes it as the latest GitHub release tagged `v<version>`. If a release for the current version already exists, the workflow skips the build, so unrelated pushes to `main` are no-ops.
 
+## Recovery
+
+Every proxy setting points at the daemon's listener, so a daemon that is not running means no network at all. It reverts those settings itself if it fails to start, but if you are stuck and cannot reach anything:
+
+```sh
+sudo /usr/local/libexec/wifi-proxy-daemon/wifi-proxy-daemon --reset
+```
+
+That restores direct networking without uninstalling. To remove it entirely:
+
+```sh
+sudo /usr/local/libexec/wifi-proxy-daemon/uninstall.sh
+```
+
+If both are gone, revert by hand:
+
+```sh
+# Stop the daemon first, or KeepAlive restarts it and it republishes everything.
+sudo launchctl bootout system /Library/LaunchDaemons/com.ginsbc.wifi-proxy-daemon.plist
+
+networksetup -listallnetworkservices | tail -n +2 | sed 's/^\*//' | while IFS= read -r s; do
+  sudo networksetup -setwebproxystate "$s" off
+  sudo networksetup -setsecurewebproxystate "$s" off
+  sudo networksetup -setproxybypassdomains "$s" Empty
+done
+
+git config --global --unset http.proxy
+git config --global --unset https.proxy
+
+for v in ALL_PROXY all_proxy HTTP_PROXY http_proxy HTTPS_PROXY https_proxy \
+         NO_PROXY no_proxy JAVA_OPTS java_opts ES_JAVA_OPTS SBT_OPTS sbt_opts; do
+  launchctl unsetenv "$v"
+done
+```
+
+Every network service has to be reverted, not just Wi-Fi, or you stay offline on Ethernet.
+
+The proxy settings are also reachable without a terminal in System Settings > Network > (service) > Proxies. Restart your browser and terminal afterwards, since they read the old values at launch.
+
 ## Troubleshooting
 
-- Daemon log: `/var/log/wifi-proxy-daemon.log`
+- Daemon log: `/var/log/wifi-proxy-daemon.log`, which records each route switch
 - State file: `/var/run/wifi-proxy-daemon.state`
+- Confirm the listener is up with `nc -z 127.0.0.1 3128` (or your `WIFI_PROXY_LISTEN_PORT`). If it is not, nothing will reach the network; check the log.
 - Detection uses the DNS domain rather than the Wi-Fi SSID, because recent macOS releases gate SSID access behind Location Services, which a root LaunchDaemon cannot obtain.
+- The listener uses POSIX sockets rather than Network.framework, which routes every connection through the macOS system proxy setting with no working opt-out. Since that setting points at the listener itself, a Network.framework dial would loop straight back in.
 - Notification permission is requested at install time and again the first time a notification is posted.

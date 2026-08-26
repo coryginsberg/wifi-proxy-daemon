@@ -23,9 +23,9 @@ STATE_PATH="/var/run/wifi-proxy-daemon.state"
 LOG_PATH="/var/log/wifi-proxy-daemon.log"
 DOMAIN_MATCH="${WIFI_PROXY_DOMAIN_MATCH:-cat.com}"
 VPN_MATCH="${WIFI_PROXY_VPN_MATCH:-Cisco Secure Client}"
-PROXY_URL="${WIFI_PROXY_URL:-http://proxy.cat.com:80}"
 PROXY_HOST="${WIFI_PROXY_HOST:-proxy.cat.com}"
 PROXY_PORT="${WIFI_PROXY_PORT:-80}"
+LISTEN_PORT="${WIFI_PROXY_LISTEN_PORT:-3128}"
 PROXY_NO_PROXY="${WIFI_PROXY_NO_PROXY:-localhost,127.0.0.1,::1,.cat.com,169.254.169.254}"
 PROXY_NON_PROXY_HOSTS="${WIFI_PROXY_NON_PROXY_HOSTS:-*.cat.com|localhost|127.0.0.1|::1}"
 PACKAGE_VERSION="${PACKAGE_VERSION:-$(<"$PROJECT_DIR/VERSION")}"
@@ -36,7 +36,7 @@ export WIFI_PROXY_VERSION="$PACKAGE_VERSION"
 rm -rf "$BUILD_DIR"
 mkdir -p "$INSTALL_DIR" "$SHARE_DIR" "$ROOT_DIR/Library/LaunchDaemons" "$DIST_DIR"
 
-swiftc "$PROJECT_DIR/main.swift" -o "$STAGED_BINARY_PATH"
+swiftc "$PROJECT_DIR/main.swift" "$PROJECT_DIR/LocalProxyServer.swift" -O -o "$STAGED_BINARY_PATH"
 chmod 755 "$STAGED_BINARY_PATH"
 
 "$PROJECT_DIR/build-notifier-app.sh" "$APP_PATH"
@@ -50,17 +50,17 @@ chmod 644 "$SHARE_DIR/shell-integration.zsh"
 python3 "$PROJECT_DIR/render_plist.py" \
   "$PROJECT_DIR/com.ginsbc.wifi-proxy-daemon.plist.template" \
   "$PLIST_PATH" \
-  "$SYSTEM_BINARY_PATH" \
-  "$DOMAIN_MATCH" \
-  "$STATE_PATH" \
-  "$LOG_PATH" \
-  "$VPN_MATCH" \
-  "$PROXY_URL" \
-  "$PROXY_HOST" \
-  "$PROXY_PORT" \
-  "$PROXY_NO_PROXY" \
-  "$PROXY_NON_PROXY_HOSTS" \
-  "$NOTIFIER_APP_PATH"
+  "BINARY_PATH=$SYSTEM_BINARY_PATH" \
+  "DOMAIN_MATCH=$DOMAIN_MATCH" \
+  "STATE_PATH=$STATE_PATH" \
+  "LOG_PATH=$LOG_PATH" \
+  "VPN_MATCH=$VPN_MATCH" \
+  "PROXY_HOST=$PROXY_HOST" \
+  "PROXY_PORT=$PROXY_PORT" \
+  "LISTEN_PORT=$LISTEN_PORT" \
+  "PROXY_NO_PROXY=$PROXY_NO_PROXY" \
+  "PROXY_NON_PROXY_HOSTS=$PROXY_NON_PROXY_HOSTS" \
+  "NOTIFIER_APP=$NOTIFIER_APP_PATH"
 
 pkgbuild \
   --root "$ROOT_DIR" \
