@@ -24,6 +24,9 @@ final class WiFiProxyController {
     /// settings still point at it.
     private let watchdogInterval: TimeInterval = TimeInterval(ProcessInfo.processInfo.environment["WIFI_PROXY_WATCHDOG_INTERVAL"] ?? "") ?? 300
     private var watchdogTimer: Timer?
+    /// False under --listen-only. Notifications are user-visible, so a
+    /// development run must not post them.
+    private var publishesConfiguration = true
     private var pendingEvaluation: DispatchWorkItem?
     private var isEvaluating = false
 
@@ -59,6 +62,8 @@ final class WiFiProxyController {
     /// without touching system proxy settings, launchd env, the shell file, or
     /// git config. Lets the proxy be exercised without root or side effects.
     func run(publishConfiguration: Bool = true) {
+        publishesConfiguration = publishConfiguration
+
         do {
             // Managed configuration is published only after the listener is
             // confirmed accepting. Pointing clients at a loopback port that
@@ -725,6 +730,10 @@ final class WiFiProxyController {
     }
 
     private func sendNotification(subtitle: String, message: String) {
+        guard publishesConfiguration else {
+            return
+        }
+
         guard let consoleUser = Self.consoleUser() else {
             return
         }
