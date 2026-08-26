@@ -419,56 +419,119 @@ final class WiFiProxyController {
         updateGitProxy(for: consoleUser, enabled: enabled)
     }
 
+    /// Brings every network service to the desired proxy state, writing only
+    /// where it already differs.
+    ///
+    /// Each write commits to SystemConfiguration and makes configd reconfigure
+    /// the stack, which visibly disrupts Wi-Fi. Since the daemon reapplies this
+    /// on every start, unconditional writes churned the network on each restart
+    /// for no reason. Reads are free of that side effect.
     private func updateSystemProxy(enabled: Bool) {
-        let listenPort = String(proxyConfiguration.listenPort)
+        let desired = enabled
+            ? WebProxyState(enabled: true, server: ProxyConfiguration.localHost, port: String(proxyConfiguration.listenPort))
+            : WebProxyState(enabled: false, server: "", port: "")
+        let desiredBypass = enabled ? proxyConfiguration.bypassDomains : []
+
+        var corrected: [String] = []
 
         for service in networkServices() {
             if enabled {
-                runProcess(
-                    executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setwebproxy", service, ProxyConfiguration.localHost, listenPort],
-                    errorPrefix: "Failed to set web proxy for \(service)"
-                )
-                runProcess(
-                    executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setsecurewebproxy", service, ProxyConfiguration.localHost, listenPort],
-                    errorPrefix: "Failed to set secure web proxy for \(service)"
-                )
-                runProcess(
-                    executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setwebproxystate", service, "on"],
-                    errorPrefix: "Failed to enable web proxy for \(service)"
-                )
-                runProcess(
-                    executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setsecurewebproxystate", service, "on"],
-                    errorPrefix: "Failed to enable secure web proxy for \(service)"
-                )
+                if webProxyState(service: service, secure: false) != desired {
+                    setWebProxy(service: service, secure: false)
+                    corrected.append("\(service) http")
+                }
+                if webProxyState(service: service, secure: true) != desired {
+                    setWebProxy(service: service, secure: true)
+                    corrected.append("\(service) https")
+                }
+            } else {
+                if webProxyState(service: service, secure: false)?.enabled != false {
+                    setWebProxyState(service: service, secure: false, on: false)
+                    corrected.append("\(service) http")
+                }
+                if webProxyState(service: service, secure: true)?.enabled != false {
+                    setWebProxyState(service: service, secure: true, on: false)
+                    corrected.append("\(service) https")
+                }
+            }
 
-                let bypassArguments = ["-setproxybypassdomains", service] + proxyConfiguration.bypassDomains
+            if bypassDomains(service: service) != desiredBypass {
+                let arguments = ["-setproxybypassdomains", service] + (desiredBypass.isEmpty ? ["Empty"] : desiredBypass)
                 runProcess(
                     executablePath: "/usr/sbin/networksetup",
-                    arguments: bypassArguments,
+                    arguments: arguments,
                     errorPrefix: "Failed to set bypass domains for \(service)"
                 )
-            } else {
-                runProcess(
-                    executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setwebproxystate", service, "off"],
-                    errorPrefix: "Failed to disable web proxy for \(service)"
-                )
-                runProcess(
-                    executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setsecurewebproxystate", service, "off"],
-                    errorPrefix: "Failed to disable secure web proxy for \(service)"
-                )
-                runProcess(
-                    executablePath: "/usr/sbin/networksetup",
-                    arguments: ["-setproxybypassdomains", service, "Empty"],
-                    errorPrefix: "Failed to clear bypass domains for \(service)"
-                )
+                corrected.append("\(service) bypass")
             }
         }
+
+        // Silence means every service already matched and nothing was written,
+        // which is the normal case on a restart.
+        if corrected.isEmpty {
+            fputs("System proxy already correct; no changes written\n", stderr)
+        } else {
+            fputs("System proxy corrected: \(corrected.joined(separator: ", "))\n", stderr)
+        }
+    }
+
+    private func setWebProxy(service: String, secure: Bool) {
+        runProcess(
+            executablePath: "/usr/sbin/networksetup",
+            arguments: [
+                secure ? "-setsecurewebproxy" : "-setwebproxy",
+                service,
+                ProxyConfiguration.localHost,
+                String(proxyConfiguration.listenPort)
+            ],
+            errorPrefix: "Failed to set \(secure ? "secure " : "")web proxy for \(service)"
+        )
+        setWebProxyState(service: service, secure: secure, on: true)
+    }
+
+    private func setWebProxyState(service: String, secure: Bool, on: Bool) {
+        runProcess(
+            executablePath: "/usr/sbin/networksetup",
+            arguments: [secure ? "-setsecurewebproxystate" : "-setwebproxystate", service, on ? "on" : "off"],
+            errorPrefix: "Failed to update \(secure ? "secure " : "")web proxy state for \(service)"
+        )
+    }
+
+    /// `nil` when the current state cannot be read, which callers treat as a
+    /// mismatch so an unreadable service still gets written rather than skipped.
+    private func webProxyState(service: String, secure: Bool) -> WebProxyState? {
+        guard let output = processOutput(
+            executablePath: "/usr/sbin/networksetup",
+            arguments: [secure ? "-getsecurewebproxy" : "-getwebproxy", service],
+            errorPrefix: "Failed to read proxy state for \(service)"
+        ) else {
+            return nil
+        }
+
+        return WebProxyState(networksetupOutput: output)
+    }
+
+    private func bypassDomains(service: String) -> [String] {
+        guard let output = processOutput(
+            executablePath: "/usr/sbin/networksetup",
+            arguments: ["-getproxybypassdomains", service],
+            errorPrefix: "Failed to read bypass domains for \(service)"
+        ) else {
+            // Unreadable counts as a mismatch, so the caller rewrites it.
+            return ["<unreadable>"]
+        }
+
+        let lines = output
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        // networksetup reports an empty list as a sentence rather than no output.
+        if lines.count == 1 && lines[0].lowercased().contains("aren't any") {
+            return []
+        }
+
+        return lines
     }
 
     private func networkServices() -> [String] {
