@@ -20,6 +20,10 @@ final class WiFiProxyController {
     private var wasProxyEnabled: Bool
     private var hasReconciledState = false
     private let evaluationDebounceInterval: TimeInterval = 2.5
+    /// How often to re-check that the listener is alive and the published
+    /// settings still point at it.
+    private let watchdogInterval: TimeInterval = TimeInterval(ProcessInfo.processInfo.environment["WIFI_PROXY_WATCHDOG_INTERVAL"] ?? "") ?? 300
+    private var watchdogTimer: Timer?
     private var pendingEvaluation: DispatchWorkItem?
     private var isEvaluating = false
 
@@ -71,6 +75,7 @@ final class WiFiProxyController {
 
                     if publishConfiguration {
                         self.applyManagedConfiguration(enabled: true)
+                        self.startWatchdog()
                     }
                     self.evaluateProxyState()
                 }
@@ -134,6 +139,59 @@ final class WiFiProxyController {
 
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
         CFRunLoopRun()
+    }
+
+    /// Corporate software manages proxy settings too, and this machine has a
+    /// WSS agent that can rewrite them. Re-assert periodically so drift heals
+    /// instead of silently taking the machine offline.
+    ///
+    /// Cheap because `applyManagedConfiguration` only writes what differs: a
+    /// tick where nothing changed is a handful of reads and no reconfiguration.
+    private func startWatchdog() {
+        watchdogTimer?.invalidate()
+
+        let timer = Timer(timeInterval: watchdogInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.reconcile()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdogTimer = timer
+    }
+
+    private func reconcile() {
+        // launchd only restarts the daemon if the process dies. A live process
+        // whose listener stopped accepting would otherwise go unnoticed, and
+        // every proxy-aware app on the machine points at that listener.
+        guard listenerIsAccepting() else {
+            fputs("Local proxy is no longer accepting; reverting and exiting\n", stderr)
+            applyManagedConfiguration(enabled: false)
+            exit(1)
+        }
+
+        applyManagedConfiguration(enabled: true)
+    }
+
+    private func listenerIsAccepting() -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            return true
+        }
+        defer { close(fd) }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = proxyConfiguration.listenPort.bigEndian
+        address.sin_addr = in_addr(s_addr: INADDR_LOOPBACK.bigEndian)
+
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        return connected == 0
     }
 
     /// Prints the detected network state without touching any configuration.

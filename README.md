@@ -104,6 +104,16 @@ The `VERSION` file is the single source of truth for the package version and the
 
 Pushing a `VERSION` change to `main` triggers `.github/workflows/release.yml`, which builds the package on a macOS runner and publishes it as the latest GitHub release tagged `v<version>`. If a release for the current version already exists, the workflow skips the build, so unrelated pushes to `main` are no-ops.
 
+## Watchdog
+
+Every five minutes the daemon re-checks that its listener is still accepting and that the published proxy settings still point at it, correcting them if not. This matters on a managed machine, where MDM or a corporate web-security agent may rewrite proxy settings.
+
+Reconciliation only writes settings that are actually wrong, so a check where nothing changed costs a few reads and does not disturb the network. The log records whether anything was corrected.
+
+If the listener has stopped accepting, the daemon reverts every setting and exits so launchd can restart it, rather than leaving the machine pointed at a dead port.
+
+One consequence: turning the proxy off by hand gets undone within five minutes. Use `--reset` after unloading the daemon if you want it to stay off.
+
 ## Recovery
 
 Every proxy setting points at the daemon's listener, so a daemon that is not running means no network at all. It reverts those settings itself if it fails to start, but if you are stuck and cannot reach anything:
